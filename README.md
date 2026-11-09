@@ -7,13 +7,13 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![C](https://img.shields.io/badge/C-GCC-A8B9CC?style=for-the-badge&logo=c&logoColor=white)](https://gcc.gnu.org)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20WSL-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://docs.microsoft.com/en-us/windows/wsl/)
-[![Version](https://img.shields.io/badge/Version-2.0-FF0000?style=for-the-badge)](https://github.com/shaheeryasirofficial/cuban-eight)
+[![Version](https://img.shields.io/badge/Version-3.0-FF0000?style=for-the-badge)](https://github.com/init1Security/Cuban-Eight)
 
 <br>
 
 *WSL Distro Packager for Red Team Research*
 
-**Author:** [Maverick](https://github.com/shaheeryasirofficial)
+**Author:** [init1Security](https://github.com/init1Security)
 
 </div>
 
@@ -45,7 +45,7 @@ wsl: Failed to translate 'C:\Users\USER\Desktop'
 Press any key to exit...
 ```
 
-Mount warnings appear briefly because `wsl.conf` only takes effect after OOBE completes. Suppressing this window is on the roadmap.
+Mount warnings appear briefly because `wsl.conf` only takes effect after OOBE completes. As of v3.0, the console window auto-dismisses after ~1.5 seconds (see **Silent Execution** below).
 
 </details>
 
@@ -53,31 +53,39 @@ Mount warnings appear briefly because `wsl.conf` only takes effect after OOBE co
 
 ## How It Works
 
-The `.wsl` format is a plain uncompressed tar of a Linux rootfs. Cuban Eight builds a scratch rootfs (~18KB) with no real Linux binaries.
+The `.wsl` format is a gzip-compressed POSIX ustar tar of a Linux rootfs. Cuban Eight builds a scratch rootfs (~35KB uncompressed, ~3KB compressed) with no real Linux userland.
 
 ```
 Double-click .wsl
        │
        ▼
-Windows registers distro
+Windows registers distro (POSIX ustar + gzip + /bin/sh stub passes validation)
        │
        ▼
 WSL logs in as root
        │
        ▼
-/etc/passwd shell field → /root/payload.exe
+/etc/passwd shell → /root/init.exe (4KB Windows PE wrapper)
        │
        ▼
-binfmt_misc intercepts execv on MZ binary
+binfmt_misc intercepts MZ → Windows CreateProcess
        │
        ▼
-Windows CreateProcess → payload runs on host
+init.exe: FreeConsole() + CreateProcess(payload.exe, DETACHED_PROCESS)
+       │                + CreateProcess(closer.exe, CREATE_NO_WINDOW)
+       │
+       ▼
+init.exe exits → closer.exe sends Enter after 1.5s → console auto-closes
+       │
+       ▼
+Payload running silently on host — no visible window
 ```
 
-- No `/bin/sh`
-- No shell scripts
-- No interpreter in the rootfs
-- Rootfs size: ~18KB (vs Alpine Linux ~8MB)
+- `/bin/sh` is a 129-byte ELF stub (exits immediately, exists only to pass WSL rootfs validation)
+- `init.exe` is a 4KB Windows PE that launches the payload detached and spawns the closer
+- `closer.exe` is a 3.5KB Windows PE that sleeps 1.5s then sends a keystroke to dismiss the OOBE prompt
+- No shell scripts, no interpreter, no Linux userland
+- Compressed package size: ~3KB + payload size
 
 ---
 
@@ -86,9 +94,11 @@ Windows CreateProcess → payload runs on host
 ```
 cuban-eight/
 ├── cuban-eight.py      Python frontend (interactive menu)
-├── build.sh            Compiles C backend
+├── build.sh            Compiles C backend (requires zlib)
 └── c/
-    ├── cuban8_pack.c   Builds the ustar tar and writes the .wsl
+    ├── cuban8_pack.c   Builds the gzip tar and writes the .wsl
+    ├── wrapper_pe.h    Embedded init.exe (4KB Windows PE wrapper)
+    ├── closer_pe.h     Embedded closer.exe (3.5KB keystroke sender)
     └── cuban8-pack     Compiled binary (after build)
 ```
 
@@ -131,8 +141,29 @@ The interactive menu walks through:
 | `kali` | Kali Linux Rolling |
 | `opensuse` | openSUSE Leap 15.5 |
 | `fedora` | Fedora Linux 39 |
+| `alpine` | Alpine Linux |
 
 </div>
+
+---
+
+## Silent Execution
+
+Previous versions left the WSL console window open after payload execution. v3.0 solves this with a three-stage PE chain embedded in the rootfs:
+
+| File | Size | Role |
+|:---|:---|:---|
+| `init.exe` | 4 KB | Root's login shell. Calls `FreeConsole()`, spawns payload with `DETACHED_PROCESS \| CREATE_NO_WINDOW`, spawns closer, exits. |
+| `closer.exe` | 3.5 KB | Sleeps 1.5s, sends `VK_RETURN` via `keybd_event` to dismiss the WSL OOBE "Press any key to exit" prompt. |
+| `payload.exe` | varies | The actual implant, running as an independent Windows process with no console. |
+
+**Why a Windows PE wrapper instead of a Linux launcher?**
+
+During WSL's first-launch OOBE, `/mnt/c` is not yet mounted — Linux-side `execve` calls to Windows binaries under `/mnt/c/Windows/System32/` fail with `ENOENT`. However, PE files stored in the WSL rootfs execute via `binfmt_misc` without needing `/mnt/c`, because the kernel's interop handler calls `CreateProcess` directly. This is why `init.exe` lives in `/root/` alongside the payload.
+
+**Why not fork/background from Linux?**
+
+WSL terminates orphaned Linux processes when the login shell exits. A forked child that `execve`s the payload gets killed before execution completes. The Windows-side `DETACHED_PROCESS` flag is the only reliable way to outlive the WSL session.
 
 ---
 
