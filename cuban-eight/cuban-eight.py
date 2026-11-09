@@ -32,7 +32,7 @@ BANNER = r"""
 def print_banner():
     os.system("cls" if platform.system() == "Windows" else "clear")
     print(cyan(BANNER))
-    print(f"  {dim('WSL Distro Packager  Red Team Research')}  {yellow('v2.0')}")
+    print(f"  {dim('WSL Distro Packager  Red Team Research')}  {yellow('v3.0')}")
     print(f"  {dim('Author :')}  {white('Maverick')}")
     print(f"  {dim('GitHub :')}  {cyan('https://github.com/shaheeryasirofficial')}")
     print(f"\n{dim('─' * 89)}\n")
